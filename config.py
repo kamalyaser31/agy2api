@@ -8,6 +8,29 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _load_env_file() -> None:
+    """Load key-value pairs from local .env if present."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        with env_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                k = key.strip()
+                v = val.strip().strip("\"'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+_load_env_file()
+
+
 def _resolve_agy() -> str:
     """Find the agy executable regardless of the launching shell's PATH.
 
@@ -163,15 +186,18 @@ class Settings:
         )
     )
     workdir: Path = Path(
-        os.getenv("AGY_WORKDIR", str(Path(__file__).resolve().parent.parent))
+        os.getenv(
+            "AGY_WORKDIR", str(Path(__file__).resolve().parent / "isolated_workspace")
+        )
     )
     # Lessons from relay.mjs: sandbox, permission automation, and read-only mode
     sandbox: bool = _bool_env("AGY2API_SANDBOX", False)
-    dangerously_skip_permissions: bool = _bool_env("AGY2API_SKIP_PERMISSIONS", True)
+    dangerously_skip_permissions: bool = _bool_env("AGY2API_SKIP_PERMISSIONS", False)
     read_only: bool = _bool_env("AGY2API_READ_ONLY", False)
     models: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
         if self.read_only:
             object.__setattr__(self, "sandbox", True)
             object.__setattr__(self, "dangerously_skip_permissions", True)

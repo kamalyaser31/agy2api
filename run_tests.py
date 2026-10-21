@@ -89,6 +89,15 @@ class ModelResolutionTests(unittest.TestCase):
 class ConfigurationSettingsTests(unittest.TestCase):
     """Test settings defaults and read-only mode behavior."""
 
+    def test_default_settings_quarantines_workspace_and_disables_skip_permissions(
+        self,
+    ) -> None:
+        """Default configuration must not skip permissions and use isolated workspace."""
+        settings = Settings()
+        self.assertFalse(settings.dangerously_skip_permissions)
+        self.assertEqual(settings.workdir.name, "isolated_workspace")
+        self.assertTrue(settings.workdir.exists())
+
     def test_read_only_mode_enables_sandbox_and_permission_skip(self) -> None:
         """AGY2API_READ_ONLY must activate sandbox and auto-approve permissions."""
         settings = Settings(read_only=True)
