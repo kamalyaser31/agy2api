@@ -79,10 +79,10 @@ MODEL_ALIASES: dict[str, str] = {
 def resolve_model(
     model: str | None, effort: str | None = None
 ) -> tuple[str | None, str | None]:
-    """Translate an exposed model id and optional reasoning_effort to (agy_model, agy_effort).
+    """Translate exposed model id and optional effort to (agy_model, agy_effort).
 
-    If the catalog bakes effort into the model name (e.g. Gemini 3.8 Flash High/Med/Low),
-    we select the matching variant directly and drop agy_effort so agy does not exit with
+    If the catalog bakes effort into the model name,
+    we select matching variant and drop agy_effort so agy does not exit with
     '--effort is not supported for model ...'.
     """
     if not model:
@@ -167,7 +167,7 @@ class Settings:
     )
     # Lessons from relay.mjs: sandbox, permission automation, and read-only mode
     sandbox: bool = _bool_env("AGY2API_SANDBOX", False)
-    dangerously_skip_permissions: bool = _bool_env("AGY2API_SKIP_PERMISSIONS", False)
+    dangerously_skip_permissions: bool = _bool_env("AGY2API_SKIP_PERMISSIONS", True)
     read_only: bool = _bool_env("AGY2API_READ_ONLY", False)
     models: list[str] = None  # type: ignore[assignment]
 
