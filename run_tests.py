@@ -16,7 +16,12 @@ import time
 import unittest
 from pathlib import Path
 
-from agy_runner import check_windows_command_length
+from agy_runner import (
+    AbortContext,
+    _read_response_with_retry,
+    check_windows_command_length,
+    sweep_all_conversations,
+)
 from config import MODEL_MAP, Settings, resolve_model
 from conversation_reader import UpstreamError, read_response
 from fake_stream import build_chunks, split_text, sse_event
@@ -148,6 +153,14 @@ class ChatRequestValidationTests(unittest.TestCase):
         self.assertEqual(req.model, "gemini-3.8-flash")
         self.assertEqual(len(req.messages), 1)
 
+    def test_default_request_model_resolves_to_supported_catalog_model(self) -> None:
+        """Default request model must be gemini-3.8-flash and resolve in catalog."""
+        req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hi")])
+        self.assertEqual(req.model, "gemini-3.8-flash")
+        resolved, _ = resolve_model(req.model)
+        self.assertIsNotNone(resolved)
+        self.assertIn(req.model, MODEL_MAP)
+
 
 class ConversationDatabaseReaderTests(unittest.TestCase):
     """Test reading responses, reasoning, and upstream errors from real SQLite databases."""
@@ -208,6 +221,33 @@ class ConversationDatabaseReaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             read_response(self.db_path)
 
+    def test_database_locked_operational_error_retries_and_succeeds(self) -> None:
+        """_read_response_with_retry must retry on sqlite3.OperationalError and succeed."""
+        f1 = _encode_field(1, 2, "Response after lock".encode("utf-8"))
+        payload = _encode_field(20, 2, f1)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO steps VALUES (1, 15, 3, ?)", (payload,))
+        conn.commit()
+        conn.close()
+
+        from unittest.mock import patch
+        import conversation_reader
+
+        orig_read = conversation_reader.read_response
+        attempts = 0
+
+        def flaky_read(path: Path) -> conversation_reader.AgResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return orig_read(path)
+
+        with patch("agy_runner.read_response", side_effect=flaky_read):
+            res = _read_response_with_retry(Path(self.db_path))
+            self.assertEqual(res.answer, "Response after lock")
+            self.assertEqual(attempts, 2)
+
 
 class SessionStoreTests(unittest.TestCase):
     """Test stateful session store prefix matching and eviction."""
@@ -246,6 +286,35 @@ class SessionStoreTests(unittest.TestCase):
         evicted = store.remember("conv-3", [fingerprint("user", "3")])
         self.assertIn("conv-1", evicted)
         self.assertIsNone(store.lookup([fingerprint("user", "1")]).conversation_id)
+
+    def test_dynamic_system_prompt_timestamp_preserves_session_continuity(self) -> None:
+        """System prompt timestamp fluctuation must not break stateful chat continuation."""
+        store = SessionStore(max_sessions=10)
+        sys1 = fingerprint("system", "Assistant prompt. Time: 10:00:00")
+        u1 = fingerprint("user", "Hello")
+        a1 = fingerprint("assistant", "Hi there")
+        store.remember("conv-dynamic-1", [sys1, u1, a1])
+
+        # Next turn has slightly changed timestamp in system prompt
+        sys2 = fingerprint("system", "Assistant prompt. Time: 10:00:15")
+        u2 = fingerprint("user", "What is the weather?")
+        plan = store.lookup([sys2, u1, a1, u2])
+
+        self.assertEqual(plan.conversation_id, "conv-dynamic-1")
+        self.assertEqual(plan.prefix_len, 3)
+
+    def test_explicit_session_hint_routes_to_matched_session(self) -> None:
+        """Explicit session hint from client binds request to the existing session."""
+        store = SessionStore(max_sessions=10)
+        u1 = fingerprint("user", "Turn 1")
+        a1 = fingerprint("assistant", "Reply 1")
+        u2 = fingerprint("user", "Turn 2")
+
+        store.remember("conv-explicit-1", [u1, a1], session_hint="user-session-abc")
+        plan = store.lookup([u1, a1, u2], session_hint="user-session-abc")
+
+        self.assertEqual(plan.conversation_id, "conv-explicit-1")
+        self.assertEqual(plan.prefix_len, 2)
 
 
 class FakeStreamHelpersTests(unittest.TestCase):
@@ -314,6 +383,57 @@ class WindowsCommandLineGuardTests(unittest.TestCase):
             set(),
             f"Oversized command leaked log files: {new_leaked_logs}",
         )
+
+
+class ProcessResilienceAndSafetyTests(unittest.TestCase):
+    """Test process lifecycle termination and sweep path containment."""
+
+    def test_abort_context_terminates_running_process(self) -> None:
+        """Calling abort() on AbortContext must terminate child process immediately."""
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        ctx = AbortContext()
+        ctx.proc = proc
+        self.assertIsNone(proc.poll())
+
+        ctx.abort()
+        self.assertTrue(ctx.aborted)
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+        self.assertIsNotNone(proc.poll(), "Process should be terminated after abort()")
+
+    def test_sweep_refuses_deletion_when_conversations_dir_outside_stateful_home(
+        self,
+    ) -> None:
+        """sweep_all_conversations must return 0 and refuse deletion outside stateful_home."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            unsafe_conv = temp_path / "conversations"
+            unsafe_conv.mkdir()
+            dummy_db = unsafe_conv / "dummy.db"
+            dummy_db.write_text("test", encoding="utf-8")
+
+            from unittest.mock import patch
+            from config import Settings
+
+            mock_settings = Settings()
+            object.__setattr__(mock_settings, "conversations_dir", unsafe_conv)
+            object.__setattr__(
+                mock_settings, "stateful_home", temp_path / "different_home"
+            )
+
+            with patch("agy_runner.settings", mock_settings):
+                removed = sweep_all_conversations()
+                self.assertEqual(removed, 0)
+                self.assertTrue(dummy_db.exists(), "Dummy DB must not be deleted")
 
 
 if __name__ == "__main__":

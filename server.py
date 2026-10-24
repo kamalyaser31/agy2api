@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import logging
 import os
 import subprocess
@@ -20,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pathlib import Path
 
 from agy_runner import (
+    AbortContext,
     cleanup_conversation,
     run_agy_async,
     sweep_all_conversations,
@@ -29,7 +29,6 @@ from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
 from session_store import SessionStore, fingerprint
-
 
 logger = logging.getLogger("agy2api")
 
@@ -66,15 +65,23 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             errors="replace",
             timeout=10,
             env=settings.agy_env(),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            ),
         )
         if ver_proc.returncode == 0:
             first_line = (ver_proc.stdout.strip().split("\n") or [""])[0]
             logger.info("startup preflight: agy CLI is operational (%s)", first_line)
         else:
-            logger.warning("startup preflight: agy changelog returned %d: %s", ver_proc.returncode, ver_proc.stderr.strip())
+            logger.warning(
+                "startup preflight: agy changelog returned %d: %s",
+                ver_proc.returncode,
+                ver_proc.stderr.strip(),
+            )
     except FileNotFoundError:
-        logger.error("startup preflight: agy executable not found at %s", settings.agy_path)
+        logger.error(
+            "startup preflight: agy executable not found at %s", settings.agy_path
+        )
     except subprocess.TimeoutExpired:
         logger.warning("startup preflight: agy changelog timed out after 10s")
     except Exception as exc:
@@ -105,7 +112,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             try:
                 removed = sweep_all_conversations()
                 if removed:
-                    logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
+                    logger.info(
+                        "shutdown (stateful): wiped %d conversation db(s)", removed
+                    )
             except Exception as exc:  # never block shutdown on housekeeping
                 logger.warning("shutdown sweep failed: %s", exc)
 
@@ -157,9 +166,12 @@ async def _run_agy_guarded(
     conversation_id: str | None = None,
     keep: bool = False,
     effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ):
     async with _run_semaphore:
-        return await run_agy_async(prompt, model, conversation_id, keep, effort)
+        return await run_agy_async(
+            prompt, model, conversation_id, keep, effort, abort_context
+        )
 
 
 async def _execute_run(
@@ -168,6 +180,7 @@ async def _execute_run(
     resume_id: str | None,
     keep: bool,
     effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ):
     """Run agy, serializing turns of the same resumed conversation so concurrent
     requests for one chat don't corrupt its session.
@@ -180,20 +193,26 @@ async def _execute_run(
         async with _conv_lock(resume_id):
             _in_flight.add(resume_id)
             try:
-                return await _run_agy_guarded(prompt, model, resume_id, keep, effort)
+                return await _run_agy_guarded(
+                    prompt, model, resume_id, keep, effort, abort_context
+                )
             finally:
                 _in_flight.discard(resume_id)
-    return await _run_agy_guarded(prompt, model, None, keep, effort)
+    return await _run_agy_guarded(prompt, model, None, keep, effort, abort_context)
 
 
 def _msg_sigs(messages: list[Any]) -> list[str]:
     return [
-        fingerprint(getattr(m, "role", "user"), _content_to_text(getattr(m, "content", "")))
+        fingerprint(
+            getattr(m, "role", "user"), _content_to_text(getattr(m, "content", ""))
+        )
         for m in messages
     ]
 
 
-def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
+def _plan_request(
+    messages: list[Any], session_hint: str | None = None
+) -> tuple[str, str | None, list[str]]:
     """Return (prompt_to_send, resume_conversation_id, sigs).
 
     In stateful mode, if this request continues a known chat, send only the new
@@ -202,9 +221,9 @@ def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
     if _session_store is None:
         return format_messages(messages), None, []
     sigs = _msg_sigs(messages)
-    plan = _session_store.lookup(sigs)
+    plan = _session_store.lookup(sigs, session_hint=session_hint)
     if plan.conversation_id and plan.prefix_len < len(messages):
-        new = messages[plan.prefix_len:]
+        new = messages[plan.prefix_len :]
         # Drop leading assistant turns — those are agy's own prior replies that
         # the client echoes back; agy already has them in memory.
         while new and getattr(new[0], "role", "") == "assistant":
@@ -214,10 +233,14 @@ def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
     return format_messages(messages), None, sigs
 
 
-def _record_session(conversation_id: str, sigs: list[str]) -> None:
+def _record_session(
+    conversation_id: str, sigs: list[str], session_hint: str | None = None
+) -> None:
     if _session_store is None or not conversation_id:
         return
-    for evicted in _session_store.remember(conversation_id, sigs, protected=_in_flight):
+    for evicted in _session_store.remember(
+        conversation_id, sigs, protected=_in_flight, session_hint=session_hint
+    ):
         _conv_locks.pop(evicted, None)  # drop the lock too (no unbounded growth)
         try:
             cleanup_conversation(evicted)
@@ -258,17 +281,38 @@ async def chat_completions(
 ):
     model = request_body.model
     agy_model, agy_effort = resolve_model(model, request_body.reasoning_effort)
-    prompt, resume_id, sigs = _plan_request(request_body.messages)
+    session_hint = (
+        request.headers.get("X-Session-Id")
+        or request.headers.get("X-Conversation-Id")
+        or request_body.user
+    )
+    prompt, resume_id, sigs = _plan_request(request_body.messages, session_hint)
     keep = settings.stateful
     logger.info(
         "request: model=%s (agy=%s) effort=%s (agy_effort=%s) stream=%s messages=%d prompt_chars=%d resume=%s",
-        model, agy_model, request_body.reasoning_effort, agy_effort, request_body.stream,
-        len(request_body.messages), len(prompt), bool(resume_id),
+        model,
+        agy_model,
+        request_body.reasoning_effort,
+        agy_effort,
+        request_body.stream,
+        len(request_body.messages),
+        len(prompt),
+        bool(resume_id),
     )
 
     if request_body.stream:
         return StreamingResponse(
-            _stream_response(prompt, model, agy_model, request, resume_id, keep, sigs, agy_effort),
+            _stream_response(
+                prompt,
+                model,
+                agy_model,
+                request,
+                resume_id,
+                keep,
+                sigs,
+                agy_effort,
+                session_hint,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -280,16 +324,25 @@ async def chat_completions(
         _forget_session(resume_id)
         logger.error(
             "FAILED (non-stream): model=%s prompt_chars=%d after %.1fs -> %s",
-            model, len(prompt), time.time() - started, exc, exc_info=True,
+            model,
+            len(prompt),
+            time.time() - started,
+            exc,
+            exc_info=True,
         )
         return _error_response(str(exc), status_code=500)
 
-    _record_session(Path(result.db_path).stem, sigs)
+    _record_session(Path(result.db_path).stem, sigs, session_hint=session_hint)
     fr = "length" if result.response.truncated else "stop"
     logger.info(
         "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
-        model, len(result.response.answer), len(result.response.reasoning),
-        result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
+        model,
+        len(result.response.answer),
+        len(result.response.reasoning),
+        result.response.truncated,
+        result.db_path.name,
+        bool(resume_id),
+        time.time() - started,
     )
     return JSONResponse(
         content=build_completion_response(
@@ -315,17 +368,21 @@ async def _stream_response(
     keep: bool = False,
     sigs: list[str] | None = None,
     effort: str | None = None,
+    session_hint: str | None = None,
 ) -> AsyncIterator[bytes]:
     started = time.time()
-    task = asyncio.create_task(_execute_run(prompt, agy_model, resume_id, keep, effort))
+    abort_ctx = AbortContext()
+    task = asyncio.create_task(
+        _execute_run(prompt, agy_model, resume_id, keep, effort, abort_ctx)
+    )
     try:
         while not task.done():
             if await request.is_disconnected():
                 logger.warning(
-                    "client disconnected after %.1fs; agy run continues in background "
-                    "until it finishes (cannot be interrupted mid-print)",
+                    "client disconnected after %.1fs; aborting agy subprocess",
                     time.time() - started,
                 )
+                abort_ctx.abort()
                 task.cancel()
                 return
             yield sse_event(make_heartbeat(model))
@@ -333,20 +390,31 @@ async def _stream_response(
 
         result = await task
         if sigs:
-            _record_session(Path(result.db_path).stem, sigs)
+            _record_session(Path(result.db_path).stem, sigs, session_hint=session_hint)
         fr = "length" if result.response.truncated else "stop"
         logger.info(
             "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
-            model, len(result.response.answer), len(result.response.reasoning),
-            result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
+            model,
+            len(result.response.answer),
+            len(result.response.reasoning),
+            result.response.truncated,
+            result.db_path.name,
+            bool(resume_id),
+            time.time() - started,
         )
-        async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
+        async for item in stream_chunks(
+            result.response.answer, result.response.reasoning, model, finish_reason=fr
+        ):
             yield item
     except Exception as exc:
         _forget_session(resume_id)
         logger.error(
             "FAILED (stream): model=%s prompt_chars=%d after %.1fs -> %s",
-            model, len(prompt), time.time() - started, exc, exc_info=True,
+            model,
+            len(prompt),
+            time.time() - started,
+            exc,
+            exc_info=True,
         )
         yield sse_event({"error": {"message": str(exc), "type": "agy_error"}})
         yield sse_event("[DONE]")
@@ -379,7 +447,9 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def build_completion_response(answer: str, reasoning: str, model: str, finish_reason: str = "stop") -> dict:
+def build_completion_response(
+    answer: str, reasoning: str, model: str, finish_reason: str = "stop"
+) -> dict:
     created = int(time.time())
     message: dict[str, Any] = {"role": "assistant", "content": answer}
     if settings.expose_reasoning and reasoning:

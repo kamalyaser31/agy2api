@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -25,6 +26,32 @@ _PERMISSION_DENIED_RE = re.compile(
 
 # Same logger name as server.py so retry/timeout warnings share one format.
 logger = logging.getLogger("agy2api")
+
+
+class AbortContext:
+    """Thread-safe cancellation context for an in-flight agy run."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.aborted: bool = False
+
+    def abort(self) -> None:
+        self.aborted = True
+        proc = self.proc
+        if proc and proc.pid:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/pid", str(proc.pid), "/t", "/f"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    proc.kill()
+            else:
+                proc.kill()
 
 
 @dataclass(frozen=True)
@@ -91,6 +118,7 @@ def _run_agy_once(
     conversation_id: str | None,
     keep: bool,
     effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
     """Run agy exactly once and read the result. See run_agy for retry policy."""
     start_time = time.time()
@@ -171,6 +199,11 @@ def _run_agy_once(
                 env=settings.agy_env(),
                 creationflags=creationflags,
             )
+            if abort_context is not None:
+                abort_context.proc = proc
+                if abort_context.aborted:
+                    abort_context.abort()
+                    raise RuntimeError("agy run aborted before completion")
             try:
                 raw_stdout, raw_stderr = proc.communicate(
                     timeout=settings.request_timeout + 20
@@ -356,6 +389,7 @@ def run_agy(
     conversation_id: str | None = None,
     keep: bool = False,
     effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
     """Run agy, retrying transient upstream errors.
 
@@ -375,7 +409,9 @@ def run_agy(
     last_exc: Exception | None = None
     for attempt in range(_UPSTREAM_RETRY_MAX):
         try:
-            return _run_agy_once(prompt, model, conversation_id, keep, effort)
+            return _run_agy_once(
+                prompt, model, conversation_id, keep, effort, abort_context
+            )
         except UpstreamError as exc:
             last_exc = exc
             if _is_permanent_upstream(str(exc)):
@@ -504,6 +540,16 @@ def sweep_all_conversations() -> int:
     directory = settings.conversations_dir
     if not directory.exists():
         return 0
+    # Safety invariant: refuse to sweep unless directory is inside stateful_home
+    try:
+        directory.resolve().relative_to(settings.stateful_home.resolve())
+    except ValueError:
+        logger.error(
+            "sweep_all_conversations refused: %s is outside stateful_home %s",
+            directory,
+            settings.stateful_home,
+        )
+        return 0
     removed = 0
     for db_path in directory.glob("*.db"):
         _cleanup_conversation(db_path)
@@ -554,7 +600,7 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
             # whether to retry the whole run (with backoff), instead of burning
             # the 3s read-retry window here on every attempt.
             raise
-        except ValueError:
+        except (ValueError, sqlite3.OperationalError, sqlite3.DatabaseError):
             if time.time() >= deadline:
                 raise
             time.sleep(0.2)
@@ -566,9 +612,10 @@ async def run_agy_async(
     conversation_id: str | None = None,
     keep: bool = False,
     effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
     return await asyncio.to_thread(
-        run_agy, prompt, model, conversation_id, keep, effort
+        run_agy, prompt, model, conversation_id, keep, effort, abort_context
     )
 
 
